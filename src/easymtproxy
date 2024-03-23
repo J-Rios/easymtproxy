@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+
+##############################################################################
+
+### Installation Setup ###
+
+VERSION="1.0.0"
+DATE="2024/03/23"
+SCRIPT_NAME=$(basename "$0")
+
+# TelegramMessenger/MTProxy only support systems with 16 bits PIDs
+# YanceyChiew/MTProxy is used instead that fix it and improve resources
+#MTPROXY_GIT_REPO="https://github.com/TelegramMessenger/MTProxy"
+MTPROXY_GIT_REPO="https://github.com/YanceyChiew/MTProxy"
+GET_PROXY_CFG="https://core.telegram.org/getProxyConfig"
+GET_PROXY_SERVER_SECRET="https://core.telegram.org/getProxySecret"
+
+INSTALL_DIR="/opt"
+CFG_DIR="${INSTALL_DIR}/MTProxy/objs/cfg"
+BIN_DIR="${INSTALL_DIR}/MTProxy/objs/bin"
+MTPROXY_BIN="${BIN_DIR}/mtproto-proxy"
+PROXY_CFG="${CFG_DIR}/proxy-multi.conf"
+PROXY_SECRET_SERVER="${CFG_DIR}/proxy-server-secret"
+PROXY_SECRET_USER="${CFG_DIR}/proxy-user-secret"
+RENEW_CFG_SCRIPT="${BIN_DIR}/mtproto-renew-cfg"
+SYSTEMD_MTPROXY="/etc/systemd/system/mtproxy.service"
+
+PWD=$(pwd)
+HOST=$(hostname -I)
+PORT="$1"
+
+##############################################################################
+
+# Auxiliary Functions
+
+# Script Help Information
+show_help()
+{
+    echo ""
+    echo "${SCRIPT_NAME} v${VERSION} ($DATE)"
+    echo ""
+    echo "You need to specify a MTProxy Port for client connections:"
+    echo "${SCRIPT_NAME} 443"
+    echo ""
+}
+
+# APT update function
+apt_update()
+{
+    echo "-------------------------------------------------"
+    echo " Updating Repositories"
+    echo "-------------------------------------------------"
+    apt-get update
+    echo ""
+}
+
+# APT install package function
+apt_install()
+{
+    if [ $# -gt 0 ]; then
+        echo "-------------------------------------------------"
+        echo " Installing ${1} package"
+        echo "-------------------------------------------------"
+        apt-get -y install "${1}"
+        if [[ $? != 0 ]]; then
+            echo "Error: Can't install ${1} package."
+            echo ""
+            exit 1
+        fi
+        echo ""
+    fi
+}
+
+# Get MTProxy Project Source Code
+get_mtproxy()
+{
+    echo "-------------------------------------------------"
+    echo " MTProxy Download"
+    echo "-------------------------------------------------"
+    cd "${INSTALL_DIR}" || exit 1
+    rm -rf ./MTProxy
+    git clone $MTPROXY_GIT_REPO
+    if [[ $? != 0 ]]; then
+        echo "Error: MTProxy Download Fail."
+        echo ""
+        exit 1
+    fi
+    echo ""
+    cd "${PWD}" || exit 1
+}
+
+# Build and compile MTProxy
+build_mtproxy()
+{
+    echo "-------------------------------------------------"
+    echo " MTProxy Build"
+    echo "-------------------------------------------------"
+    cd "${INSTALL_DIR}/MTProxy" || exit 1
+    make clean
+    make
+    if [[ $? != 0 ]]; then
+        echo "Error: MTProxy Compile Fail."
+        echo ""
+        exit 1
+    fi
+    echo ""
+    cd "${PWD}" || exit 1
+}
+
+# Install MTProxy
+install_mtproxy()
+{
+    echo "-------------------------------------------------"
+    echo " MTProxy Install"
+    echo "-------------------------------------------------"
+    ln -sf "$MTPROXY_BIN" "/usr/bin"
+    mtproto-proxy --help >/dev/null 2>&1
+    if [[ $? != 2 ]]; then
+        echo "Error: MTProxy Installation Fail."
+        echo ""
+        exit 1
+    fi
+    echo "Installation done, mtproto-proxy available"
+    echo ""
+}
+
+# Setup MTProxy Default Configuration (Proxy Secrets & config)
+setup_mtproxy()
+{
+    echo "-------------------------------------------------"
+    echo " MTProxy Setup"
+    echo "-------------------------------------------------"
+    # Create config directory and add
+    mkdir -p "$CFG_DIR"
+    curl -s $GET_PROXY_CFG -o "$PROXY_CFG"
+    if [[ $? != 0 ]]; then
+        echo "Error: MTProxy Setup Fail (cannot get Telegram config)."
+        echo ""
+        exit 1
+    fi
+    echo "Telegram Server connection Configuration received"
+    curl -s $GET_PROXY_SERVER_SECRET -o "$PROXY_SECRET_SERVER"
+    if [[ $? != 0 ]]; then
+        echo "Error: MTProxy Setup Fail (cannot get Server Secret)."
+        echo ""
+        exit 1
+    fi
+    echo "Telegram Server connection Secret received"
+    USER_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
+    echo "$USER_SECRET" > "$PROXY_SECRET_USER"
+    if [[ $? != 0 ]]; then
+        echo "Error: MTProxy Setup Fail (cannot create user Secret)."
+        echo ""
+        exit 1
+    fi
+    echo "Telegram Proxy user connection Secret created"
+    # Create MTProxy renew proxy config script
+    echo "#!/usr/bin/env bash" > "$RENEW_CFG_SCRIPT"
+    echo "" >> "$RENEW_CFG_SCRIPT"
+    echo "curl -s $GET_PROXY_CFG -o $PROXY_CFG && \\" >> "$RENEW_CFG_SCRIPT"
+    echo "systemctl restart mtproxy" >> "$RENEW_CFG_SCRIPT"
+    echo "exit 0" >> "$RENEW_CFG_SCRIPT"
+    chmod +x "$RENEW_CFG_SCRIPT"
+    echo "Telegram Proxy connection configuration renew script created"
+    # Add renew script to run daily via Cron (only if it is not already there)
+    (crontab -l | grep -q "$RENEW_CFG_SCRIPT") || \
+    (crontab -l ; echo "0 0 * * * $RENEW_CFG_SCRIPT") | crontab -
+    echo "Renew script added to Crontab (renew config daily)"
+    # Create MTProxy service to automatic run
+    echo "[Unit]" > "$SYSTEMD_MTPROXY"
+    echo "Description=MTProxy" >> "$SYSTEMD_MTPROXY"
+    echo "After=network.target" >> "$SYSTEMD_MTPROXY"
+    echo "" >> "$SYSTEMD_MTPROXY"
+    echo "[Service]" >> "$SYSTEMD_MTPROXY"
+    echo "WorkingDirectory=${BIN_DIR}" >> "$SYSTEMD_MTPROXY"
+    echo "ExecStart=${MTPROXY_BIN} -u nobody -p 8888 -H $PORT -S $USER_SECRET \
+--aes-pwd $PROXY_SECRET_SERVER $PROXY_CFG -M 1" >> "$SYSTEMD_MTPROXY"
+    echo "Restart=on-failure" >> "$SYSTEMD_MTPROXY"
+    echo "" >> "$SYSTEMD_MTPROXY"
+    echo "[Install]" >> "$SYSTEMD_MTPROXY"
+    echo "WantedBy=multi-user.target" >> "$SYSTEMD_MTPROXY"
+    echo "" >> "$SYSTEMD_MTPROXY"
+    echo "MTProxy Systemd Service created"
+    echo ""
+}
+
+# Enable & Start MTProxy Service
+start_mtproxy()
+{
+    echo "-------------------------------------------------"
+    echo " MTProxy Service Start"
+    echo "-------------------------------------------------"
+    systemctl enable mtproxy.service
+    systemctl start mtproxy.service
+    sleep 2
+    systemctl status mtproxy.service
+    echo ""
+}
+
+##############################################################################
+
+### Main Functionality ###
+
+# Check for Administrator Permission
+if [ "$(id -u)" != "0" ]; then
+    echo ""
+    echo "This script must be executed with administration privileges."
+    echo ""
+    exit 1
+fi
+
+# Check for required arguments
+if [ $# -lt 1 ]; then
+    show_help
+    exit 1
+fi
+
+# Start Info
+echo ""
+echo "Installing MTProxy..."
+echo ""
+
+# Install Build Requirements
+apt_update
+apt_install build-essential
+apt_install curl
+apt_install gcc
+apt_install git
+apt_install libssl-dev
+apt_install make
+apt_install zlib1g-dev
+
+# Get, Build & Install MTProxy
+get_mtproxy
+build_mtproxy
+install_mtproxy
+
+# Setup MTProxy
+setup_mtproxy
+
+# Start MTProxy
+start_mtproxy
+
+# End Info
+# Note User Secret stating with "dd" means to use padding connection
+echo ""
+echo "MTProxy installation Completed."
+echo ""
+echo "Connection Information:"
+echo "Host: $HOST"
+echo "Port: $PORT"
+echo "Secret: dd$USER_SECRET"
+echo ""
+
+exit 0
+
+##############################################################################
